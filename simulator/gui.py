@@ -19,15 +19,21 @@ LIME      = "#d7f24e"
 LIME_DEEP = "#a9c52e"
 PURPLE    = "#b7a6f2"
 AMBER     = "#f5c451"
+GREEN     = "#2fae6e"   # philosopher: eating
+TEAL      = "#5bc0d8"   # fork: free
+CORAL     = "#e2574c"   # fork: locked
 
+# Philosopher and fork states are drawn on the same canvas, so each group
+# gets its own hues — no color is reused across the two, or a "thinking"
+# philosopher and a "locked" fork would be indistinguishable at a glance.
 PHIL_COLOR = {
     "THINKING": (DARK_BG, DARK_TEXT),
     "HUNGRY":   (AMBER, TEXT),
     "WAITING":  (PURPLE, TEXT),
-    "EATING":   (LIME, TEXT),
+    "EATING":   (GREEN, DARK_TEXT),
 }
-FORK_FREE   = (LIME, TEXT)
-FORK_LOCKED = (DARK_BG, DARK_TEXT)
+FORK_FREE   = TEAL
+FORK_LOCKED = CORAL
 
 STATUS_COLOR = {
     "STOPPED": MUTED,
@@ -58,7 +64,7 @@ class DiningGUI:
         self.delay = 100
         self.log = []  # (text, is_write) tuples
 
-        root.title("Dining Philosophers — Virtual 8086")
+        root.title("Dining Philosophers Simulation using Assembly Code")
         root.geometry("1320x880")
         root.minsize(1080, 720)
         root.configure(bg=PAGE_BG)
@@ -179,6 +185,14 @@ class DiningGUI:
         card = self._card(parent, fill="both", expand=True)
         self.canvas = tk.Canvas(card, bg=CARD_BG, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, padx=2, pady=2)
+        for i in range(5):
+            self.canvas.tag_bind(f"phil{i}", "<Button-1>",
+                                  lambda e, i=i: self._on_phil_click(i, e))
+        # The canvas has no real size until Tk lays it out, so the first
+        # refresh() (called before the window is mapped) draws the table
+        # using a fallback size and it ends up pinned in the corner.
+        # Redraw once the canvas actually has its final size.
+        self.canvas.bind("<Configure>", lambda e: self._draw_table(snapshot(self.cpu)))
 
     def _build_controls(self, parent):
         card = self._card(parent, fill="x", pady=(0, 12))
@@ -245,11 +259,17 @@ class DiningGUI:
             swatch(cell, PHIL_COLOR[state][0], state.title())
 
         forks = ttk.Frame(box, style="Card.TFrame")
-        forks.pack(fill="x")
-        for color, label in ((FORK_FREE[0], "Fork free"), (FORK_LOCKED[0], "Fork locked")):
+        forks.pack(fill="x", pady=(0, 8))
+        for color, label in ((FORK_FREE, "Fork free"), (FORK_LOCKED, "Fork locked")):
             cell = ttk.Frame(forks, style="Card.TFrame")
             cell.pack(side="left", expand=True)
             swatch(cell, color, label)
+
+        ttk.Separator(box).pack(fill="x", pady=(0, 8))
+        ttk.Label(box, text="Click a philosopher on the table to set their state "
+                            "by hand. Two neighbors can't both be Eating — they'd "
+                            "need the same fork.",
+                  style="Muted.TLabel", wraplength=280, justify="left").pack(anchor="w")
 
     def _build_state_panels(self, parent):
         card = self._card(parent, fill="both", expand=True)
@@ -363,6 +383,50 @@ class DiningGUI:
         self._set_status("DEADLOCK DEMO" if mode == 0 else "SAFE MODE")
         self._loop()
 
+    def _on_phil_click(self, idx, event):
+        menu = tk.Menu(self.root, tearoff=0)
+        for val in (0, 1, 3, 2):  # Thinking, Hungry, Waiting, Eating
+            menu.add_command(label=STATE_NAMES[val].title(),
+                              command=lambda v=val: self._manual_set_state(idx, v))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _manual_set_state(self, idx, new_val):
+        self.running = False
+        self._set_status("PAUSED")
+
+        if new_val == 2:  # EATING needs both neighbor forks free
+            left_n, right_n = (idx - 1) % 5, (idx + 1) % 5
+            if (self.cpu.memory.get(f"PHIL{left_n + 1}", 0) == 2 or
+                    self.cpu.memory.get(f"PHIL{right_n + 1}", 0) == 2):
+                messagebox.showwarning(
+                    "Not possible",
+                    f"Philosopher {idx + 1} can't eat right now — a neighboring "
+                    "philosopher is already eating, and they share a fork. "
+                    "Two adjacent philosophers can never eat at the same time.")
+                return
+
+        self.cpu.memory[f"PHIL{idx + 1}"] = new_val
+        self._sync_forks_from_states()
+        state_name = STATE_NAMES[new_val].title()
+        self.log.append((f"Manual: Philosopher {idx + 1} set to {state_name}", True))
+        self.log = self.log[-250:]
+        self.explain_var.set(f"Manually set Philosopher {idx + 1} to {state_name}.")
+        self.refresh()
+
+    def _sync_forks_from_states(self):
+        """Recompute fork locks from philosopher states: a fork is locked
+        only while one of its two owners is EATING. Keeps manual edits
+        consistent without needing separate fork bookkeeping."""
+        forks = [0] * 5
+        for i in range(5):
+            if self.cpu.memory.get(f"PHIL{i + 1}", 0) == 2:
+                left, right = _PHIL_FORKS[i]
+                forks[left] = 1
+                forks[right] = 1
+        for i in range(5):
+            self.cpu.memory[f"FORK{i + 1}"] = forks[i]
+        self.cpu.memory["DEADLOCK"] = 0
+
     def step_once(self):
         self.running = False
         self._set_status("PAUSED")
@@ -470,6 +534,21 @@ class DiningGUI:
     # Canvas drawing
     # ------------------------------------------------------------------
 
+    def _draw_fork_icon(self, c, x, y, color, number):
+        """Draw a small dinner-fork glyph (tines + neck + handle), colored
+        by state, with no background disc — just the fork itself."""
+        tine_top = y - 18
+        tine_bottom = y - 4
+        for tx in (-6, 0, 6):
+            c.create_line(x + tx, tine_top, x + tx, tine_bottom,
+                          fill=color, width=3, capstyle="round")
+        c.create_line(x - 6, tine_bottom, x + 6, tine_bottom,
+                      fill=color, width=3, capstyle="round")
+        c.create_line(x, tine_bottom, x, y + 20,
+                      fill=color, width=4, capstyle="round")
+
+        c.create_text(x, y + 32, text=f"F{number}", fill=MUTED, font=(FONT, 8, "bold"))
+
     def _draw_table(self, s):
         c = self.canvas
         c.delete("all")
@@ -494,7 +573,7 @@ class DiningGUI:
 
         c.create_oval(cx - table_r, cy - table_r, cx + table_r, cy + table_r,
                       fill=SHELL_BG, outline=CARD_BORDER, width=2)
-        c.create_text(cx, cy, text="8086", fill=MUTED, font=(FONT, 14, "bold"))
+        c.create_text(cx, cy, text="Dinning Table", fill=MUTED, font=(FONT, 14, "bold"))
 
         is_deadlock = bool(s["deadlock"])
 
@@ -507,7 +586,7 @@ class DiningGUI:
             if state == "EATING":
                 for fk in (left_fork, right_fork):
                     fx, fy = fork_pos[fk]
-                    c.create_line(px, py, fx, fy, fill=LIME_DEEP, width=2, dash=(6, 4))
+                    c.create_line(px, py, fx, fy, fill=GREEN, width=2, dash=(6, 4))
 
             elif is_deadlock or (s["mode"] == 0 and state == "WAITING"):
                 fx_left, fy_left = fork_pos[left_fork]
@@ -523,18 +602,19 @@ class DiningGUI:
 
         for i, val in enumerate(s["forks"]):
             x, y = fork_pos[i]
-            fill, fg = FORK_LOCKED if val else FORK_FREE
-            c.create_oval(x - 20, y - 20, x + 20, y + 20, fill=fill, outline=CARD_BG, width=2)
-            c.create_text(x, y, text=f"F{i + 1}", fill=fg, font=(FONT, 9, "bold"))
+            color = FORK_LOCKED if val else FORK_FREE
+            self._draw_fork_icon(c, x, y, color, i + 1)
 
         for i, val in enumerate(s["philosophers"]):
             x, y = phil_pos[i]
             state = STATE_NAMES.get(val, "UNKNOWN")
             fill, fg = PHIL_COLOR.get(state, (MUTED, TEXT))
+            tag = f"phil{i}"
 
-            c.create_oval(x - 48, y - 34, x + 48, y + 34, fill=fill, outline=CARD_BG, width=2)
-            c.create_text(x, y - 8, text=f"P{i + 1}", fill=fg, font=(FONT, 12, "bold"))
-            c.create_text(x, y + 12, text=state.title(), fill=fg, font=(FONT, 8, "bold"))
+            c.create_oval(x - 48, y - 34, x + 48, y + 34, fill=fill, outline=CARD_BG,
+                          width=2, tags=(tag,))
+            c.create_text(x, y - 8, text=f"P{i + 1}", fill=fg, font=(FONT, 12, "bold"), tags=(tag,))
+            c.create_text(x, y + 12, text=state.title(), fill=fg, font=(FONT, 8, "bold"), tags=(tag,))
 
         if is_deadlock:
             c.create_text(cx, h - 34, text="Deadlock — every philosopher is stuck waiting",
