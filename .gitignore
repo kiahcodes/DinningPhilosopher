@@ -1,5 +1,4 @@
-# Ignore common Python virtual environments
+__pycache__/
+*.pyc
 venv/
 .venv/
-env/
-s
