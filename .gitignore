@@ -1,0 +1,5 @@
+# Ignore common Python virtual environments
+venv/
+.venv/
+env/
+s
